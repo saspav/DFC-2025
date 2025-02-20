@@ -32,6 +32,9 @@ WORK_PATH = Path('Z:/python-datasets/4cast')
 if not WORK_PATH.is_dir():
     WORK_PATH = Path('D:/python-datasets/4cast')
 
+if not WORK_PATH.is_dir():
+    WORK_PATH = Path('.')
+
 DATASET_PATH = WORK_PATH.joinpath('data')
 
 if not WORK_PATH.is_dir():
