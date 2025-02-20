@@ -53,6 +53,9 @@ MODELS_LOGS = WORK_PATH.joinpath('scores_local.logs')
 MODELS_LOGS_REG = WORK_PATH.joinpath('scores_local_reg.logs')
 
 if not DATASET_PATH.exists():
+    DATASET_PATH = Path('/kaggle/input/dfc-2025-4cast/data')
+
+if not DATASET_PATH.exists():
     DATASET_PATH = Path('.')
     __file__ = Path('.')
     LOCAL_FILE = ''
