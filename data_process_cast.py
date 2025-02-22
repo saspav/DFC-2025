@@ -10,9 +10,14 @@ import featuretools as ft
 from woodwork.logical_types import Age, Categorical, Datetime
 
 from io import StringIO
+from datetime import timedelta
 from glob import glob
 from copy import deepcopy
 from pathlib import Path
+
+from tsfresh import extract_features
+from tsfresh import extract_relevant_features
+from tsfresh.feature_extraction import MinimalFCParameters, EfficientFCParameters
 
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline, make_pipeline
@@ -282,7 +287,7 @@ class DataTransform:
                     inn_test.to_pandas())
         return calendar, inn, profiles, inn_test
 
-    def make_agg_data(self, shift_start=0, shift_total=16, w_size=56, remake_file=False,
+    def make_agg_data(self, shift_start=0, shift_total=24, w_size=48, remake_file=False,
                       sample=None, add_agg_data=True, log_target=True, use_featuretools=False,
                       file_with_target_class=None, **kwargs):
         """
@@ -298,6 +303,14 @@ class DataTransform:
         :param file_with_target_class: Используем предсказания классификатора о поломке машины
         :return: ДФ трейна и теста с агрегированными данными
         """
+
+        # Определяем квартал для каждой даты с учетом дополнительных дней
+        def determine_quarter(start_date):
+            # Получаем список кварталов на протяжении 7 дней
+            quarters = [(start_date + timedelta(days=d)).quarter for d in range(7)]
+            # Возвращаем моду (самое часто встречающееся значение)
+            return pd.Series(quarters).mode()[0]  # Берем первое значение моды
+
         aggregate_path_file = None
 
         if self.aggregate_path_file:
@@ -344,7 +357,13 @@ class DataTransform:
                 pl.col("dy1") - 1).otherwise(pl.col("dy1")).alias("dy1"),
             pl.when((pl.col("month2") > 2) & (pl.col("year2") % 4 == 0)).then(
                 pl.col("dy2") - 1).otherwise(pl.col("dy2")).alias("dy2"),
-        )
+        ).with_columns((pl.col("year1") - 2021).cast(pl.Int8).alias("year1"),
+                       (pl.col("year2") - 2021).cast(pl.Int8).alias("year2"), )
+
+        # Добавим квартал, к которому принадлежит неделя
+        weeks = weeks.to_pandas()
+        weeks['q'] = weeks['d1'].apply(determine_quarter)
+        weeks = pl.from_pandas(weeks)
 
         if log_target:
             # Взятие логарифма от таргета
@@ -354,12 +373,19 @@ class DataTransform:
         shifts = range(shift_start, shift_start + shift_total)
         # Задаем квантили
         quantiles = np.linspace(0.05, 0.95, 19).round(2)  # 0.05, 0.10, ..., 0.95
-        # Создаем колонки для rolling_max
+        # Создаем колонки для shift
         max_columns = [
-            pl.col("target").rolling_max(window_size=1, min_periods=1).shift(i).over(
-                "inn_id").alias(f"imax{i:02d}") for i in shifts]
+            pl.col("target").shift(i).over("inn_id").alias(f"shift{i:02d}") for i in shifts]
         # Создаем колонки для rolling функции с window_size=w_size
         rolling_columns = [
+            pl.col("target").rolling_mean(window_size=4, min_periods=1).shift(1).over(
+                "inn_id").alias("rmen4"),
+            pl.col("target").rolling_median(window_size=4, min_periods=1).shift(1).over(
+                "inn_id").alias("rmed4"),
+            pl.col("target").rolling_mean(window_size=8, min_periods=1).shift(1).over(
+                "inn_id").alias("rmen8"),
+            pl.col("target").rolling_median(window_size=8, min_periods=1).shift(1).over(
+                "inn_id").alias("rmed8"),
             # pl.col("target").rolling_max(window_size=w_size, min_periods=1).shift(1).over(
             #     "inn_id").alias("rmax"),
             # pl.col("target").rolling_min(window_size=w_size, min_periods=1).shift(1).over(
@@ -369,6 +395,13 @@ class DataTransform:
             pl.col("target").rolling_median(window_size=w_size, min_periods=1).shift(1).over(
                 "inn_id").alias("rmed"),
         ]
+        diffs = [1, 2, 3, 4, 8, 12,
+                 # 16,
+                 # 20,
+                 # 24
+                 ]
+        diff_columns = [
+            pl.col("target").diff(i).over("inn_id").alias(f"diff{i:02d}") for i in diffs]
         # Добавляем колонки для квантилей
         quantile_columns = [
             pl.col("target").rolling_quantile(quantile=q,
@@ -379,13 +412,25 @@ class DataTransform:
         ]
         if add_agg_data:
             # Объединяем все колонки в один список
-            all_columns = max_columns + rolling_columns + quantile_columns
+            # quantile_columns = []
+            # diff_columns = []
+            all_columns = max_columns + rolling_columns + quantile_columns + diff_columns
             # Добавляем все колонки сразу с помощью метода `with_columns`
             inn = inn.with_columns(all_columns).sort(by=["inn_id", "week"])
+
+            # Скользящее окно на лагах
+            shift_rolls = [pl.col(f"shift{i:02d}").rolling_mean(window_size=i, min_periods=1)
+                           .shift(1).over("inn_id").alias(f"srmen{i:02d}") for i in (4, 8, 12)
+                           if f"shift{i:02d}" in inn.columns]
+            # inn = inn.with_columns(shift_rolls)
 
             # Формируем данные для теста
             inn_last = inn.group_by("inn_id").last().drop(["week", "target"])
             inn_test = inn_test.join(inn_last, on="inn_id", how="left")
+
+            self.comment = dict(shift_start=shift_start,
+                                shift_total=shift_total,
+                                w_size=w_size)
 
         age = {"1m": 1,
                "2_3m": 3,
@@ -416,11 +461,13 @@ class DataTransform:
             inn = inn.drop(['d1', 'd2', 'report_date'])
             inn_test = inn_test.drop(['d1', 'd2', 'report_date'])
             # Из трейна удалим строки с пропусками:
-            max_shift_col = f"imax{shift_start + shift_total - 1:02d}"
-            inn = inn.filter(pl.col(max_shift_col).is_not_null())
+            shift_cols = f"shift{shift_start + shift_total - 1:02d}"
+            inn = inn.filter(pl.col(shift_cols).is_not_null())
         else:
             select_cols = ['inn_id', 'week', 'd1', 'target', 'workdays', 'weekends', 'ipul',
                            'id_region', 'main_okved_group', 'diff_datopen_report_date_flg']
+            if 'q' in inn.columns:
+                select_cols.insert(3, 'q')
             inn = inn.select(select_cols)
             select_cols[select_cols.index('target')] = 'predict'
             inn_test = inn_test.select(select_cols)
@@ -650,11 +697,16 @@ def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_',
     predict_valid = model.predict(X_valid)
     predict_valid = np.clip(predict_valid, 0, np.inf)
     predict_test = model.predict(test)
-    print(predict_test[:5])
     predict_test = np.clip(predict_test, 0, np.inf)
+
     if log_target:
+        y_valid = np.expm1(deepcopy(y_valid))
+        predict_valid = np.expm1(predict_valid)
         predict_test = np.expm1(predict_test)
-    print(predict_test[:5])
+
+    print(y_valid.values[:5])
+    print(predict_valid[:5].round(2))
+    print(predict_test[:5].round(2))
 
     # Сохранение предсказаний в файл
     submit_csv = f'{submit_prefix}submit_{max_num:03}{nfld}{LOCAL_FILE}_reg.csv'
@@ -666,17 +718,25 @@ def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_',
     t_score = 0
 
     # start_item = print_msg("Расчет scores...")
-    # Root Mean Squared Error
+    # Root Mean Squared Error: квадратный корень среднеквадратичной ошибки
+    # - среднее отклонение предсказанных значений от фактических значений без учета знака
     auc_macro = mean_squared_error(y_valid, predict_valid) ** 0.5
-    # Mean Absolute Error
+    # Mean Absolute Error: среднее абсолютное отклонение предсказанных значений от фактических
     auc_micro = mean_absolute_error(y_valid, predict_valid)
-    # Mean Squared Error
+    # Mean Squared Error: средний квадрат отклонений предсказаний от фактических значений
     auc_wght = mean_squared_error(y_valid, predict_valid)
-    # R² Score
+    # R² Score показывает, какую долю вариации зависимой переменной объясняет модель. Значение
+    # R² варьируется от 0 до 1 (или может быть отрицательным, если модель плоха).
+    # Значение 1 говорит о том, что модель идеально подходит к данным.
     f1_macro = r2_score(y_valid, predict_valid)
-    # Mean Squared Logarithmic Error
+    # Mean Squared Logarithmic Error: измеряет среднюю разницу между логарифмами предсказанных
+    # и фактических значений. Это полезно в случаях, когда хотим уменьшить влияние больших
+    # ошибок, особенно при работе с экспоненциально растущими данными.
     f1_micro = mean_squared_log_error(y_valid, predict_valid)
-    # Explained Variance Score
+    # Explained Variance Score: метрика показывает долю вариации целевой переменной, которую
+    # может объяснить модель. Значение равно 1, если модель идеально объясняет данные, и
+    # 0, если модель не способна предсказать значение лучше, чем просто использовать среднее
+    # значение целевой переменной.
     f1_wght = explained_variance_score(y_valid, predict_valid)
     # print_time(start_item)
 
@@ -712,12 +772,12 @@ if __name__ == "__main__":
     # inns = train.inn_id.unique()[:10]
     # print(train)
 
-    train, test = data_cls.make_agg_data(remake_file=True, sample=sample, add_agg_data=False)
+    train, test = data_cls.make_agg_data(remake_file=True, sample=sample, add_agg_data=True)
     inns = train.inn_id.unique()[:10]
     if 'd1' in train.columns:
-        print(train[['inn_id', 'week', 'd1', 'target']])
+        print(train[['inn_id', 'week', 'd1', 'q', 'target']])
     else:
-        print(train[['inn_id', 'week', 'target']])
+        print(train[['inn_id', 'week', 'q', 'target']])
 
     train[train.inn_id.isin(inns)].to_excel(WORK_PATH.joinpath('train_sample.xlsx'),
                                             index=False)
