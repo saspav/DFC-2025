@@ -140,7 +140,7 @@ class DataTransform:
         self.test_data_path = test_data if test_data_path is None else Path(test_data_path)
         self.preprocess_files = 'preprocess_files.pkl'
         self.aggregate_path_file = 'aggregate_data_files.pkl'
-        self.fillna_value = -99
+        self.fillna_value = 0
         self.make_log10_features = True
 
     def set_category(self, df):
@@ -870,8 +870,8 @@ def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_'):
     # Постпроцессинг: зануляем значения, если binary_columns = 0
     for target, binary_col in zip(target.columns, binary_columns[1:]):
         submission.loc[submission[binary_col] == 0, target] = np.nan
-    new_cols = ['bq', 'wb', 'ra', 'li', 'bi', 'sp', 'pc', 'im']
-    submission.columns = new_cols + [f'{col}_d' for col in new_cols[1:]]
+    # new_cols = ['bq', 'wb', 'ra', 'li', 'bi', 'sp', 'pc', 'im']
+    # submission.columns = new_cols + [f'{col}_d' for col in new_cols[1:]]
     submission.to_csv(file_submit_csv)
 
     t_score = 0
@@ -928,7 +928,7 @@ if __name__ == "__main__":
                              # numeric_columns=numeric_columns, scaler=StandardScaler,
                              )
 
-    data_cls.make_log10_features = False
+    data_cls.make_log10_features = True
 
     train_df, test_df, td_train, td_test = data_cls.preprocess_data(remake_file=False,
                                                                     use_joblib=True
