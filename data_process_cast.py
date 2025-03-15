@@ -59,7 +59,7 @@ MODELS_LOGS_REG = WORK_PATH.joinpath('scores_local_reg.logs')
 
 if not DATASET_PATH.exists():
     DATASET_PATH = Path('/kaggle/input/dfc-2025-4cast/data')
-    
+
 if not DATASET_PATH.exists():
     DATASET_PATH = Path('/kaggle/input')
 
@@ -542,6 +542,8 @@ class DataTransform:
             select_cols[select_cols.index('target')] = 'predict'
             inn_test = inn_test.select(select_cols)
 
+            print('trn.columns:', trn.columns)
+
         # Сортируем и преобразуем в пандас
         train_df = trn.sort(by=["inn_id", "week"]).to_pandas()
         test_df = inn_test.to_pandas()
@@ -847,7 +849,7 @@ if __name__ == "__main__":
 
     sample = None
 
-    log_target = False
+    log_target = True
 
     # calendar, train, profiles, test = data_cls.preprocess_data(remake_file=True,
     #                                                            sample=sample,
@@ -856,10 +858,14 @@ if __name__ == "__main__":
     # inns = train.inn_id.unique()[:10]
     # print(train)
 
-    train, test = data_cls.make_agg_data(remake_file=True,
-                                         sample=sample,
+    train, test = data_cls.make_agg_data(remake_file=False,
+                                         use_sum_in_file=False,
+                                         add_agg_data=False,
+                                         shift_total=54,
+                                         w_size=53,
                                          log_target=log_target,
-                                         add_agg_data=True)
+                                         # sample=300,
+                                         )
     inns = train.inn_id.unique()[:10]
     if 'd1' in train.columns:
         print(train[['inn_id', 'week', 'd1', 'q', 'target']])
