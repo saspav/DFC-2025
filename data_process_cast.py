@@ -300,6 +300,7 @@ class DataTransform:
         if return_pandas:
             return (calendar.to_pandas(), inn.to_pandas(), profiles.to_pandas(),
                     inn_test.to_pandas())
+
         return calendar, inn, profiles, inn_test
 
     @staticmethod
@@ -418,6 +419,7 @@ class DataTransform:
         calendar, inn, profiles, inn_test = self.preprocess_data(
             remake_file=remake_file, use_sum_in_file=use_sum_in_file, sample=sample,
         )
+        # print(calendar.shape, inn.shape, profiles.shape, inn_test.shape)
 
         start_time = print_msg('Агрегация данных...')
 
@@ -497,6 +499,7 @@ class DataTransform:
                                 w_size=w_size)
         else:
             trn = inn
+            # print(inn.shape, trn.shape)
 
         age = {"1m": 1,
                "2_3m": 3,
@@ -538,7 +541,7 @@ class DataTransform:
                            'id_region', 'main_okved_group', 'diff_datopen_report_date_flg']
             if 'q' in trn.columns:
                 select_cols.insert(3, 'q')
-            trn = trn.select(select_cols + ['sum_in'] if 'sum_in' in trn.columns else [])
+            trn = trn.select(select_cols + (['sum_in'] if 'sum_in' in trn.columns else []))
             select_cols[select_cols.index('target')] = 'predict'
             inn_test = inn_test.select(select_cols)
 
