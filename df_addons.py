@@ -1,15 +1,20 @@
-import re
 import numpy as np
 import pandas as pd
+import polars as pl
+
 from pathlib import Path
 from glob import glob
-from time import time
 from bisect import bisect_left
 from print_time import print_time, print_msg
 
+try:
+    from mts_paths import WORK_PATH
+except ModuleNotFoundError:
+    WORK_PATH = Path('.')
 
 __import__("warnings").filterwarnings('ignore')
 
+file_urls = WORK_PATH.joinpath('file_urls.feather')
 
 rus = 'АЕКМНОРСТУХВ'
 eng = 'AEKMHOPCTYXB'
@@ -86,6 +91,87 @@ def age_bucket(x):
     return bisect_left([18, 25, 35, 45, 55, 65], x)
 
 
+def memory_compression_pl(df: pl.DataFrame, use_category=True, use_float=True,
+                          exclude_columns=None):
+    """
+    Оптимизация типов данных в Polars DataFrame для уменьшения потребления памяти.
+
+    :param df: Polars DataFrame
+    :param use_category: Преобразовывать строки в категорию
+    :param use_float: Преобразовывать float в пониженную разрядность
+    :param exclude_columns: Список колонок, которые исключаются из обработки
+    :return: Оптимизированный Polars DataFrame
+    """
+    exclude_columns = set(exclude_columns) if exclude_columns else set()
+
+    start_mem = df.estimated_size() / 1024 ** 2  # Размер в MB
+    schema = df.schema  # Текущие типы колонок
+
+    new_columns = []
+
+    for col, dtype in schema.items():
+        if col in exclude_columns:
+            new_columns.append(df[col])
+            continue
+
+        if isinstance(dtype, (pl.Date, pl.Datetime)):
+            new_columns.append(df[col])  # Даты не трогаем
+            continue
+
+        if isinstance(dtype, (pl.Int64, pl.Int32, pl.Int16, pl.Int8, pl.UInt16, pl.UInt32)):
+            col_min, col_max = df[col].min(), df[col].max()
+            if col_min is not None and col_max is not None:
+                if col_min >= 0:  # Проверяем на беззнаковость
+                    if col_max < np.iinfo(np.uint8).max:
+                        new_columns.append(df[col].cast(pl.UInt8))
+                    elif col_max < np.iinfo(np.uint16).max:
+                        new_columns.append(df[col].cast(pl.UInt16))
+                    elif col_max < np.iinfo(np.uint32).max:
+                        new_columns.append(df[col].cast(pl.UInt32))
+                    else:
+                        new_columns.append(df[col])  # Оставляем Int64
+                else:  # Если есть отрицательные числа, остаёмся в знаковых int
+                    if col_min > np.iinfo(np.int8).min and col_max < np.iinfo(np.int8).max:
+                        new_columns.append(df[col].cast(pl.Int8))
+                    elif col_min > np.iinfo(np.int16).min and col_max < np.iinfo(
+                            np.int16).max:
+                        new_columns.append(df[col].cast(pl.Int16))
+                    elif col_min > np.iinfo(np.int32).min and col_max < np.iinfo(
+                            np.int32).max:
+                        new_columns.append(df[col].cast(pl.Int32))
+                    else:
+                        new_columns.append(df[col])  # Оставляем Int64
+            else:
+                new_columns.append(df[col])
+
+        elif use_float and isinstance(dtype, (pl.Float64, pl.Float32)):
+            col_min, col_max = df[col].min(), df[col].max()
+            if col_min is not None and col_max is not None:
+                if col_min > np.finfo(np.float32).min and col_max < np.finfo(
+                        np.float32).max:
+                    new_columns.append(df[col].cast(pl.Float32))
+                else:
+                    new_columns.append(df[col])  # Оставляем Float64
+            else:
+                new_columns.append(df[col])
+
+        elif use_category and isinstance(dtype, pl.Utf8):
+            new_columns.append(df[col].cast(pl.Categorical))
+
+        else:
+            new_columns.append(df[col])  # Оставляем без изменений
+
+    # Создаём новый DataFrame с оптимизированными типами
+    df_compressed = pl.DataFrame(new_columns)
+
+    end_mem = df_compressed.estimated_size() / 1024 ** 2
+    print(f'Исходный размер: {round(start_mem, 2)} MB')
+    print(f'Оптимизированный размер: {round(end_mem, 2)} MB')
+    print(f'Экономия памяти: {(1 - end_mem / start_mem):.1%}')
+
+    return df_compressed
+
+
 def memory_compression(df, use_category=True, use_float=True, exclude_columns=None):
     """
     Изменение типов данных для экономии памяти
@@ -109,24 +195,19 @@ def memory_compression(df, use_category=True, use_float=True, exclude_columns=No
             col_min = df[col].min()
             col_max = df[col].max()
             if str(df[col].dtype)[:3] == 'int':
-                if col_min > np.iinfo(np.int8).min and \
-                        col_max < np.iinfo(np.int8).max:
+                if col_min > np.iinfo(np.int8).min and col_max < np.iinfo(np.int8).max:
                     df[col] = df[col].astype(np.int8)
-                elif col_min > np.iinfo(np.int16).min and \
-                        col_max < np.iinfo(np.int16).max:
+                elif col_min > np.iinfo(np.int16).min and col_max < np.iinfo(np.int16).max:
                     df[col] = df[col].astype(np.int16)
-                elif col_min > np.iinfo(np.int32).min and \
-                        col_max < np.iinfo(np.int32).max:
+                elif col_min > np.iinfo(np.int32).min and col_max < np.iinfo(np.int32).max:
                     df[col] = df[col].astype(np.int32)
-                elif col_min > np.iinfo(np.int64).min and \
-                        col_max < np.iinfo(np.int64).max:
+                elif col_min > np.iinfo(np.int64).min and col_max < np.iinfo(np.int64).max:
                     df[col] = df[col].astype(np.int64)
             elif use_float and str(df[col].dtype)[:5] == 'float':
-                if col_min > np.finfo(np.float16).min and \
-                        col_max < np.finfo(np.float16).max:
+                if col_min > np.finfo(np.float16).min and col_max < np.finfo(np.float16).max:
                     df[col] = df[col].astype(np.float16)
-                elif col_min > np.finfo(np.float32).min and \
-                        col_max < np.finfo(np.float32).max:
+                elif (col_min > np.finfo(np.float32).min
+                      and col_max < np.finfo(np.float32).max):
                     df[col] = df[col].astype(np.float32)
                 else:
                     df[col] = df[col].astype(np.float64)
@@ -201,3 +282,15 @@ def ratio_groups(df, col_name, prefix, codes, url_col='url_host', url_rf=True):
         ratio_cols = [f'{pref}_prs_{cod}' for pref in prefixes]
         url_host[f'{prefix}_avg_prs_{cod}'] = url_host[ratio_cols].mean(axis=1)
     return url_host
+
+
+if __name__ == "__main__":
+    start_time = print_msg('Объединение исходных файлов...')
+
+    files = [WORK_PATH.joinpath(f'part_df_{i}.pkl')
+             for i, _ in enumerate(glob(f'{WORK_PATH}/part*.parquet'))]
+    print(files)
+    all_df = concat_pickles(files)
+    all_df.to_pickle(WORK_PATH.joinpath('df.pkl'))
+    all_df = memory_compression(all_df)
+    print_time(start_time)
