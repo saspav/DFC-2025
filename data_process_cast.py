@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import joblib
+import gc
 
 import featuretools as ft
 from woodwork.logical_types import Age, Categorical, Datetime
@@ -14,6 +15,7 @@ from datetime import timedelta
 from glob import glob
 from copy import deepcopy
 from pathlib import Path
+from tqdm import tqdm
 
 from tsfresh import extract_features
 from tsfresh import extract_relevant_features
@@ -28,7 +30,7 @@ from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, Gr
 from sklearn.metrics import f1_score, roc_auc_score, mean_squared_error, mean_absolute_error
 from sklearn.metrics import r2_score, mean_squared_log_error, explained_variance_score
 
-from df_addons import memory_compression
+from df_addons import memory_compression, memory_compression_pl
 from print_time import print_time, print_msg
 
 __import__("warnings").filterwarnings('ignore')
@@ -198,12 +200,15 @@ class DataTransform:
         df = self.transform(df, model_columns=model_columns)
         return df
 
-    def preprocess_data(self, remake_file=False, use_sum_in_file=False, fill_nan=True,
-                        sample=None, return_pandas=False, **kwargs):
+    def preprocess_data(self, remake_file=False, use_sum_in_file=False, use_cls_trn=False,
+                        use_cls_vect=False, fill_nan=True, sample=None, return_pandas=False,
+                        **kwargs):
         """
         Предобработка данных
         :param remake_file: Переформировать файлы с агрегациями
         :param use_sum_in_file: Использовать файл с входными суммами
+        :param use_cls_trn: Использовать данные о суммах транзакций по классам
+        :param use_cls_vect: Использовать данные о частотности транзакций по классам
         :param fill_nan: заполняем пропуски в данных
         :param sample: вернуть ДФ из указанного количества inn_id
         :param return_pandas: вернуть ДФ из панд
@@ -229,7 +234,7 @@ class DataTransform:
         # Читаем календарь и отмечаем дни недели
         calendar = pl.read_csv(DATASET_PATH.joinpath("calendar.csv"),
                                try_parse_dates=True).with_columns(
-            pl.col("week").cast(pl.Int8),
+            pl.col("week").cast(pl.UInt8),
             pl.col("date").dt.weekday().alias("day_of_week").cast(pl.Int8),
         )
         holidays = pd.read_csv(DATASET_PATH.joinpath("holidays.csv"), sep=';')
@@ -241,18 +246,38 @@ class DataTransform:
         calendar = calendar.with_columns(
             (pl.col("date").is_in(holidays).not_()).alias("is_workday")
         )
-        if use_sum_in_file:
+        if use_sum_in_file or use_cls_trn or use_cls_vect:
             file_target_series = DATASET_PATH / "target_series_sum_in.parquet"
             if not file_target_series.is_file():
                 file_target_series = DATASET_PATH / "target_series_sum_in_sample.parquet"
             inn = pl.read_parquet(file_target_series).with_columns(
-                pl.col("week").cast(pl.Int8))
+                pl.col("week").cast(pl.UInt8))
+            # Удаляем колонки с суммами по классам транзакций
+            if not use_cls_trn:
+                # Колонки с суммами по классам транзакций
+                trn_ce_columns = [col for col in inn.columns if col.startswith('trn_ce_')]
+                inn = inn.drop(trn_ce_columns)
+            if not use_cls_vect:
+                # Колонки с суммами по классам транзакций
+                trn_ce_columns = [col for col in inn.columns if col.startswith('tvect_')]
+                inn = inn.drop(trn_ce_columns)
+            # Удаляем колонки с входящими суммами
+            if not use_sum_in_file:
+                sum_in_columns = [col for col in inn.columns if '_inp' in col]
+                inn = inn.drop(sum_in_columns)
         else:
             file_target_series = DATASET_PATH.joinpath("target_series.parquet")
             if not file_target_series.is_file():
                 file_target_series = DATASET_PATH.joinpath("target_series_sample.parquet")
             inn = pl.read_parquet(file_target_series).with_columns(
-                pl.col("week").cast(pl.Int8))
+                pl.col("week").cast(pl.UInt8))
+            file_target_series_ext = DATASET_PATH.joinpath("target_series_extended.parquet")
+            if file_target_series_ext.is_file():
+                inn_ext = pl.read_parquet(file_target_series_ext).with_columns(
+                    pl.col("week").cast(pl.UInt8))
+                inn = pl.concat([inn, inn_ext])
+                # print(inn["week"].unique())
+            # print(inn)
 
         file_profiles = DATASET_PATH.joinpath("profiles.parquet")
         if not file_profiles.is_file():
@@ -262,7 +287,7 @@ class DataTransform:
         file_test = DATASET_PATH.joinpath("sample_submit.csv")
         if not file_test.is_file():
             file_test = DATASET_PATH.joinpath("sample_submit_sample.csv")
-        inn_test = pl.read_csv(file_test).with_columns(pl.col("week").cast(pl.Int8))
+        inn_test = pl.read_csv(file_test, dtypes={"week": pl.UInt8, "predict": pl.Float64})
 
         if sample is not None:
             sample_id = inn['inn_id'].unique().to_list()[:sample]
@@ -271,8 +296,8 @@ class DataTransform:
             # Фильтруем DataFrame profiles
             sample_profiles = profiles.filter(pl.col('inn_id').is_in(sample_id))
             # Фильтруем DataFrame sample_submit
-            sample_submit = pl.read_csv(DATASET_PATH.joinpath("sample_submit.csv")
-                                        ).with_columns(pl.col("week").cast(pl.Int8))
+            sample_submit = pl.read_csv(file_test,
+                                        dtypes={"week": pl.UInt8, "predict": pl.Float64})
             sample_submit = sample_submit.filter(pl.col('inn_id').is_in(sample_id))
 
             inn, profiles, inn_test = sample_inn, sample_profiles, sample_submit
@@ -282,9 +307,12 @@ class DataTransform:
                     self.samples_paths = DATASET_PATH
                 else:
                     self.samples_paths = Path(self.samples_paths)
-
-                sample_inn.write_parquet(
-                    DATASET_PATH.joinpath("target_series_sample.parquet"))
+                if use_sum_in_file or use_cls_trn:
+                    sample_inn.write_parquet(
+                        DATASET_PATH.joinpath("target_series_sum_in_sample.parquet"))
+                else:
+                    sample_inn.write_parquet(
+                        DATASET_PATH.joinpath("target_series_sample.parquet"))
                 sample_profiles.write_parquet(
                     DATASET_PATH.joinpath("profiles_sample.parquet"))
                 sample_submit.write_csv(DATASET_PATH.joinpath("sample_submit_sample.csv"))
@@ -304,7 +332,7 @@ class DataTransform:
         return calendar, inn, profiles, inn_test
 
     @staticmethod
-    def _make_agg(df_inn, delta=1, shift_start=1, shift_total=24, w_size=48):
+    def _make_agg(df_inn: pl.DataFrame, delta=1, shift_start=1, shift_total=24, w_size=48):
         """
         Разные группировки
         :param df_inn:
@@ -315,19 +343,25 @@ class DataTransform:
         :return:
         """
         df_res = None
-        # Задаем количество для shift
+        # Задаем количество для shift'ов
         shifts = range(shift_start, shift_start + shift_total)
         # Задаем квантили
         quantiles = np.linspace(0.05, 0.95, 19).round(2)  # 0.05, 0.10, ..., 0.95
-        # Обрабатывать будем таргет и входящую сумму за неделю
-        for col in ("target", "sum_in"):
-            sf = col[0]
+        # Колонки с суммами по классам транзакций
+        trn_ce_columns = [col for col in df_inn.columns if col.startswith('trn_ce_')]
+        # Колонки для различных трансформаций
+        transform_columns = [col for col in df_inn.columns
+                             if col not in trn_ce_columns + ['inn_id', 'week', ]]
+        # Обрабатывать будем таргет и ...
+        for col in tqdm(transform_columns, desc=f'Преобразую колонки delta={delta}'):
+            sf = f'{col}_'
             if col not in df_inn.columns:
                 continue
+            # print(f'delta={delta}, transform_column:{col}')
             # Создаем колонки для shift
             shift_columns = [
-                pl.col(col).shift(i).over("inn_id").alias(f"{sf}shift{i:02d}") for i in
-                shifts]
+                pl.col(col).shift(i - (shift_start - delta)).over("inn_id").alias(
+                    f"{sf}shift{i:02d}") for i in shifts]
 
             # Создаем колонки для rolling функции с window_size=w_size
             rolling_columns = []
@@ -340,14 +374,14 @@ class DataTransform:
                          "inn_id").alias(f"{sf}rmed{w:02}"),
                      ])
 
-            diffs = [1, 2, 3, 4, 8, 12,
+            diffs = [1, 2, 3, 4, 5, 6, 7, 8, 12,
                      # 16,
                      # 20,
                      # 24
                      ]
             diffs = [*range(1, 17)] + [*range(17, 25)]
-            diff_columns = [
-                pl.col(col).diff(i).over("inn_id").alias(f"{sf}diff{i:02d}") for i in diffs]
+            diff_columns = [pl.col(col).diff(i - (shift_start - delta)).over("inn_id").alias(
+                f"{sf}diff{i:02d}") for i in diffs]
 
             # Добавляем колонки для квантилей
             quantile_columns = [
@@ -360,8 +394,10 @@ class DataTransform:
             ]
 
             # Объединяем все колонки в один список
-            quantile_columns = []
-            # diff_columns = []
+            quantile_columns = []  # Пока удалим колонки с квантилями
+            if 'count' in col:
+                diff_columns = []  # Пока удалим колонки с разностями
+                rolling_columns = []
             all_columns = shift_columns + rolling_columns + quantile_columns + diff_columns
             # Добавляем все колонки сразу с помощью метода with_columns
             if df_res is None:
@@ -371,16 +407,28 @@ class DataTransform:
 
             # Скользящее окно на лагах
             shift_rolls = [pl.col(f"{sf}shift{i:02d}")
-                           .rolling_mean(window_size=i, min_periods=1)
-                           .shift(delta).over("inn_id").alias(f"{sf}srmen{i:02d}")
-                           for i in (4, 8, 12, 16) if f"{sf}shift{i:02d}" in df_inn.columns]
+                               .rolling_mean(window_size=i, min_periods=1)
+                               .shift(delta).over("inn_id").alias(f"{sf}_srmen{i:02d}")
+                           for i in (4, 8, 12, 16) if f"{sf}shift{i:02d}" in df_res.columns]
             # df_res = df_res.with_columns(shift_rolls)
+
+        if trn_ce_columns:
+            # Создаем колонки для shift классов транзакций
+            shift_columns = []
+            shifts = [*range(1, 17)] + [*range(17, 25)]
+            for i in shifts:
+                cls_cols = [pl.col(col).shift(i - (shift_start - delta)).over("inn_id").alias(
+                    f"shft{i:02d}_{col}") for col in trn_ce_columns]
+                shift_columns.extend(cls_cols)
+
+            df_res = df_res.with_columns(shift_columns)
 
         return df_res
 
     def make_agg_data(self, shift_start=1, shift_total=24, w_size=48, remake_file=False,
-                      use_sum_in_file=False, sample=None, add_agg_data=True, log_target=True,
-                      add_agg_data_days=False, use_featuretools=False, **kwargs):
+                      use_sum_in_file=False, use_cls_trn=False, use_cls_vect=False,
+                      sample=None, add_agg_data=True, log_target=True, use_featuretools=False,
+                      **kwargs):
         """
         Подсчет разных агрегированных статистик
         :param shift_start: Начальный сдвиг для группировок
@@ -388,10 +436,11 @@ class DataTransform:
         :param w_size: Ширина окна для статистик
         :param remake_file: Формируем файлы снова или читаем с диска
         :param use_sum_in_file: Использовать файл с входными суммами
+        :param use_cls_trn: Использовать данные о суммах транзакций по классам
+        :param use_cls_vect: Использовать данные о частотности транзакций по классам
         :param sample: вернуть ДФ из указанного количества inn_id
         :param add_agg_data: Добавляем самодельную аггрегацию
         :param log_target: Взять логарифм от целевой переменной
-        :param add_agg_data_days: Добавить аггрегированные данные из "transactions_Z.parquet"
         :param use_featuretools: Используем модуль featuretools
         :return: ДФ трейна и теста с агрегированными данными
         """
@@ -417,9 +466,22 @@ class DataTransform:
 
         # Загрузка предобработанных данных
         calendar, inn, profiles, inn_test = self.preprocess_data(
-            remake_file=remake_file, use_sum_in_file=use_sum_in_file, sample=sample,
+            remake_file=remake_file, use_sum_in_file=use_sum_in_file, use_cls_trn=use_cls_trn,
+            use_cls_vect=use_cls_vect, sample=sample,
         )
         # print(calendar.shape, inn.shape, profiles.shape, inn_test.shape)
+
+        drop_cols = ['trns_amount_out_ip', 'trns_count_out_ip', 'cnt_inn_out_ip',
+                     # 'trns_amount_inp', 'trns_count_inp', 'cnt_inn_inp', 'date_inp',
+                     'trns_amount_inp_ip', 'trns_count_inp_ip', 'cnt_inn_inp_ip',
+                     ]
+        drop_cols = [col for col in drop_cols if col in inn.columns]
+        if drop_cols:
+            inn = inn.drop(drop_cols)
+
+        # print(inn.columns)
+        # print(inn_test.columns)
+        # exit()
 
         start_time = print_msg('Агрегация данных...')
 
@@ -454,53 +516,6 @@ class DataTransform:
         weeks['q'] = weeks['d1'].apply(determine_quarter)
         weeks = pl.from_pandas(weeks)
 
-        if log_target:
-            # Взятие логарифма от таргета
-            inn = inn.with_columns(np.log1p(pl.col("target")))
-            if 'sum_in' in inn.columns:
-                inn = inn.with_columns(np.log1p(pl.col("sum_in")))
-
-        if add_agg_data:
-            # if add_agg_data_days and self.aggregate_inn_trn_file:
-            #     trn_files = [f"transactions_{i + 1}.parquet" for i in range(4)]
-            #     try:
-            #         # Читаем и объединяем файлы
-            #         dft = pl.concat([pl.read_parquet(DATASET_PATH / tf) for tf in trn_files])
-            #
-            #     except FileNotFoundError:
-            #         dft = pl.read_parquet(DATASET_PATH / "transactions_sample.parquet")
-            #
-            #     dft = dft.with_columns(pl.col("date").cast(pl.Date))
-            #     # Мерджим транзакции с календарём по дате
-            #     dft = dft.join(calendar, on="date", how="left")
-            #     # Фильтруем только переводы в ВТБ
-            #     # trn_in = dft.filter(pl.col("doc_payee_bank_name_flag") == 1)
-            #     trn_in = dft
-            #     # Агрегируем данные по (doc_payer_inn, week, day_of_week)
-            #     agg_in = trn_in.group_by(["doc_payee_inn", "week"]).agg(
-            #         pl.sum("trns_amount").alias("sum_in"),
-            #         pl.sum("trns_count").alias("count_in")
-            #     ).rename({"doc_payee_inn": "inn_id"})
-            #
-            #     inn = inn.join(agg_in, on=["inn_id", "week"], how="left").fill_null(0)
-
-            trn = self._make_agg(inn, delta=1, shift_start=shift_start,
-                                 shift_total=shift_total, w_size=w_size)
-
-            tst = self._make_agg(inn, delta=0, shift_start=shift_start,
-                                 shift_total=shift_total, w_size=w_size)
-
-            # Формируем данные для теста
-            inn_last = tst.group_by("inn_id").last().drop(["week", "target"])
-            inn_test = inn_test.join(inn_last, on="inn_id", how="left")
-
-            self.comment = dict(shift_start=shift_start,
-                                shift_total=shift_total,
-                                w_size=w_size)
-        else:
-            trn = inn
-            # print(inn.shape, trn.shape)
-
         age = {"1m": 1,
                "2_3m": 3,
                "3_6m": 6,
@@ -513,42 +528,129 @@ class DataTransform:
                # "NULL":np.nan
                }
         ipul = {"ip": 0, "ul": 1, }
-        profiles = profiles.with_columns(
+        # Уникальные ИНН
+        test_inns = inn_test["inn_id"].unique()
+        # Уберем лишнюю инфу
+        profiles = profiles.filter(profiles['inn_id'].is_in(test_inns)).with_columns(
             pl.col("diff_datopen_report_date_flg").replace(age, default=0),
             pl.col("ipul").replace(ipul).cast(pl.String),
             pl.col("id_region").fill_null("-"),
             pl.col("main_okved_group").fill_null("-"),
         )
         profiles = profiles.sort("report_date").group_by("inn_id").last()
+        print('profiles обработан!')
+
+        if log_target:
+            # Взятие логарифма от таргета и других сумм
+            log_cols = ["target", "cum_sum"] + [col for col in inn.columns
+                                                if col.startswith('trns_amount_')]
+            for col in log_cols:
+                if col in inn.columns:
+                    inn = inn.with_columns(np.log1p(pl.col(col)))
+
+        # Сортируем
+        inn = inn.sort(by=["inn_id", "week"])
+
+        if add_agg_data:
+            # Это целевая переменная = 'target' --> нужно удалить
+            if "trns_amount_out" in inn.columns:
+                inn = inn.drop("trns_amount_out")
+
+            drop_inn_columns = [col for col in inn.columns if col not in ('inn_id', 'week',
+                                                                          'target',)]
+            print('drop_inn_columns:', drop_inn_columns)
+
+            tst = self._make_agg(inn, delta=0, shift_start=shift_start,
+                                 shift_total=shift_total, w_size=w_size)
+            tst = tst.drop(drop_inn_columns)
+
+            # Формируем данные для теста
+            inn_last = tst.group_by("inn_id").last().drop(["week", "target"])
+            inn_test = inn_test.join(inn_last, on="inn_id", how="left")
+
+            trn = self._make_agg(inn, delta=1, shift_start=shift_start,
+                                 shift_total=shift_total, w_size=w_size)
+            trn = trn.drop(drop_inn_columns)
+
+            del inn
+            gc.collect()
+
+            print('Новые признаки построены!')
+
+            self.comment = dict(shift_start=shift_start,
+                                shift_total=shift_total,
+                                w_size=w_size)
+        else:
+
+            # Определение числовых колонок (включая все целочисленные и вещественные типы)
+            numeric_cols = [col for col in inn.select(pl.selectors.numeric()).columns
+                            if col not in ('inn_id', 'week', 'target',
+                                           # 'cum_sum'
+                                           )]
+            # Применяем shift(1).over("inn_id") для всех числовых колонок
+            inn = inn.with_columns(pl.col(numeric_cols).shift(1).over("inn_id")).fill_null(0)
+
+            trn = inn
+
+            # Формируем данные для теста
+            inn_last = inn.group_by("inn_id").last().drop(["week", "target"])
+            inn_test = inn_test.join(inn_last, on="inn_id", how="left")
+
+            print('trn.columns', trn.columns)
+            # print('inn_test.columns', inn_test.columns)
+            # print(inn.shape, trn.shape)
 
         # Объединение с weeks и profiles
-        trn = trn.join(weeks, on="week", how="left").join(profiles, on="inn_id", how="left")
+        trn = trn.join(weeks, on="week", how="left")
+        print('Объединение с weeks!')
+        trn = trn.join(profiles, on="inn_id", how="left")
+        print('Объединение с profiles!')
         inn_test = inn_test.join(weeks, on="week", how="left").join(profiles, on="inn_id",
                                                                     how="left")
+        print('Объединение с weeks и profiles!')
+
         if add_agg_data:
             # Удаляем временные колонки
             trn = trn.drop(['d1', 'd2', 'report_date'])
             inn_test = inn_test.drop(['d1', 'd2', 'report_date'])
+            print('Удалены временные колонки!')
             # Из трейна удалим строки с пропусками:
-            for col in ("target", "sum_in"):
-                sf = col[0]
+            for col in ("target",):
+                sf = f'{col}_'
                 if col not in trn.columns:
                     continue
-                shift_cols = f"{sf}shift{shift_start + shift_total - 1:02d}"
-                trn = trn.filter(pl.col(shift_cols).is_not_null())
+                shift_col = f"{sf}shift{shift_start + shift_total - 1:02d}"
+                print(f'Удаляю пропуски в {shift_col}!', shift_col in trn.columns)
+                chunk_size = 500_000  # Размер чанка
+                filtered_chunks = []
+                for chunk in tqdm(trn.iter_slices(n_rows=chunk_size),
+                                  total=len(trn) / chunk_size):
+                    filtered_chunks.append(chunk.filter(pl.col(shift_col).is_not_null()))
+                trn = pl.concat(filtered_chunks)
+                print(f'Удалены пропуски в {shift_col}!')
         else:
-            select_cols = ['inn_id', 'week', 'd1', 'target', 'workdays', 'weekends', 'ipul',
-                           'id_region', 'main_okved_group', 'diff_datopen_report_date_flg']
-            if 'q' in trn.columns:
-                select_cols.insert(3, 'q')
-            trn = trn.select(select_cols + (['sum_in'] if 'sum_in' in trn.columns else []))
-            select_cols[select_cols.index('target')] = 'predict'
-            inn_test = inn_test.select(select_cols)
-
             print('trn.columns:', trn.columns)
+            print('inn_test.columns:', inn_test.columns)
 
-        # Сортируем и преобразуем в пандас
-        train_df = trn.sort(by=["inn_id", "week"]).to_pandas()
+            # select_cols = ['inn_id', 'week', 'd1', 'target', 'workdays', 'weekends', 'ipul',
+            #                'id_region', 'main_okved_group', 'diff_datopen_report_date_flg']
+            # if 'q' in trn.columns:
+            #     select_cols.insert(3, 'q')
+            # trn = trn.select(select_cols + (['sum_in'] if 'sum_in' in trn.columns else []))
+            # select_cols[select_cols.index('target')] = 'predict'
+            # inn_test = inn_test.select(select_cols)
+            #
+            # print('trn.columns:', trn.columns)
+
+        # Сортируем
+        trn = trn.sort(by=["inn_id", "week"])
+
+        # Уменьшаем типы данных
+        trn = memory_compression_pl(trn)
+        inn_test = memory_compression_pl(inn_test)
+
+        # преобразуем в пандас датафрейм
+        train_df = trn.to_pandas()
         test_df = inn_test.to_pandas()
 
         print_time(start_time)
@@ -647,101 +749,49 @@ def add_info_to_log(prf, max_num, idx_fold, model, valid_scores, info_cols,
                   f'{model_columns};{exclude_columns};{cat_columns};{comment}\n')
 
 
-def merge_submits(max_num=0, submit_prefix='cb_', num_folds=5, exclude_folds=None,
-                  use_proba=False, post_fix=''):
+def merge_submits(max_num: list, submit_prefix='cb_', post_fix=''):
     """
     Объединение сабмитов
-    :param max_num: номер итерации модели или список файлов, или список номеров сабмитов
+    :param max_num: список номеров сабмитов или список файлов
     :param submit_prefix: префикс сабмита модели
-    :param num_folds: количество фолдов модели для объединения
-    :param exclude_folds: список списков для исключения фолдов из объединения:
-                          длина списка exclude_folds должна быть равна длине списка max_num
-    :param use_proba: использовать файлы с предсказаниями вероятностей
     :param post_fix: постфикс для регрессии
     :return: None
     """
-    if use_proba:
-        prob = '_proba'
-    else:
-        prob = ''
-    # Читаем каждый файл и добавляем его содержимое в список датафреймов
     submits = pd.DataFrame()
-    if isinstance(max_num, int):
-        for nfld in range(1, num_folds + 1):
-            submit_csv = f'{submit_prefix}submit{prob}_{max_num:03}_{nfld}{LOCAL_FILE}{post_fix}.csv'
-            df = pd.read_csv(PREDICTIONS_DIR.joinpath(submit_csv), index_col='car_id')
-            if use_proba:
-                df.columns = [f'{col}_{nfld}' for col in df.columns]
-            else:
-                df.columns = [f'target_{nfld}']
-            if nfld == 1:
-                submits = df
-            else:
-                submits = submits.merge(df, on='car_id', suffixes=('', f'_{nfld}'))
-        max_num = f'{max_num:03}'
+    num_submits = False
+    if all(isinstance(z, int) for z in max_num):
+        num_submits = True
+    # Читаем каждый файл и добавляем его содержимое в список датафреймов
+    for idx, num in enumerate(sorted(max_num)):
+        if num_submits:
+            submit_csv = f'{submit_prefix}submit_{num:03}{LOCAL_FILE}_reg.csv'
+        else:
+            submit_csv = num
+        file_submit_csv = PREDICTIONS_DIR.joinpath(submit_csv)
+        df = pd.read_csv(file_submit_csv)
+        df.rename(columns={'predict': f'predict_{num}'}, inplace=True)
+        if not idx:
+            submits = df
+        else:
+            submits = submits.merge(df, on=['inn_id', 'week'], suffixes=('', f'_{idx}'))
 
-    elif isinstance(max_num, (list, tuple)) and exclude_folds is None:
-        for idx, file in enumerate(sorted(max_num)):
-            df = pd.read_csv(PREDICTIONS_DIR.joinpath(file), index_col='car_id')
-            if use_proba:
-                df.columns = [f'{col}_{idx}' for col in df.columns]
-            else:
-                df.columns = [f'target_{idx}']
-            if not idx:
-                submits = df
-            else:
-                submits = submits.merge(df, on='car_id', suffixes=('', f'_{idx}'))
+    if num_submits:
+        max_num = '-'.join(map(str, max_num))
+    else:
         max_num = '-'.join(sorted(re.findall(r'\d{3,}(?:_\d)?', ' '.join(max_num)), key=int))
 
-    elif isinstance(max_num, (list, tuple)) and isinstance(exclude_folds, (list, tuple)):
-        submits, str_nums = None, []
-        for idx, (num, exc_folds) in enumerate(zip(max_num, exclude_folds), 1):
-            str_num = str(num)
-            for file in PREDICTIONS_DIR.glob(f'*submit{prob}_{num}_*.csv'):
-                pool = re.findall(r'(?:(?<=\d{3}_)|(?<=\d{4}_))\d(?:(?=_local)|(?=\.csv))',
-                                  file.name)
-                if pool and int(pool[0]) not in exc_folds:
-                    str_num += f'_{pool[0]}'
-                    suffix = f'_{idx}_{pool[0]}'
-                    df = pd.read_csv(file, index_col='car_id')
-                    if use_proba:
-                        df.columns = [f'{col}_{suffix}' for col in df.columns]
-                    else:
-                        df.columns = [f'target{suffix}']
-                    if submits is None:
-                        submits = df
-                    else:
-                        submits = submits.merge(df, on='car_id', suffixes=('', suffix))
-            str_nums.append(str_num)
-        max_num = '-'.join(sorted(str_nums))
-        # print(df)
-        print(max_num)
+    # submits.to_excel(WORK_PATH.joinpath(f'{submit_prefix}submit_{max_num}{LOCAL_FILE}.xlsx'))
 
-    # df.to_excel(WORK_PATH.joinpath(f'{submit_prefix}submit_{max_num}{LOCAL_FILE}.xlsx'))
+    # Нахождение среднего по строкам
+    predict_columns = [col for col in submits.columns if col.startswith('predict_')]
+    submits['predict'] = submits[predict_columns].mean(axis=1)
+    # # Нахождение медианы по строкам
+    # submits['target_reg'] = submits.median(axis=1)
 
-    if use_proba:
-        # Название классов поломок
-        target_columns = sorted(set([col.rsplit('_', 1)[0] for col in submits.columns]))
-        # Суммирование по классам поломок
-        for col in target_columns:
-            submits[col] = submits.filter(like=col, axis=1).sum(axis=1)
-        # Получение имени класса поломки по максимуму из классов
-        submits['target_class'] = submits.idxmax(axis=1)
-    else:
-        if not post_fix:
-            # Нахождение моды по строкам
-            submits['target_class'] = submits.mode(axis=1)[0]
-        else:
-            # Нахождение среднего по строкам
-            submits['target_reg'] = submits.mean(axis=1)
-            # # Нахождение медианы по строкам
-            # submits['target_reg'] = submits.median(axis=1)
-
-    submits_csv = f'{submit_prefix}submit_{max_num}{LOCAL_FILE}{prob}{post_fix}.csv'
-    if not post_fix:
-        submits[['target_class']].to_csv(PREDICTIONS_DIR.joinpath(submits_csv))
-    else:
-        submits[['target_reg']].to_csv(PREDICTIONS_DIR.joinpath(submits_csv))
+    submits_csv = f'{submit_prefix}submit_{max_num}{LOCAL_FILE}_reg.csv'
+    submits[['inn_id', 'week', 'predict']].to_csv(PREDICTIONS_DIR.joinpath(submits_csv),
+                                                  index=False)
+    return submits_csv
 
 
 def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_',
@@ -846,30 +896,44 @@ if __name__ == "__main__":
     data_cls = DataTransform(use_catboost=True,
                              category_columns=[],
                              drop_first=False,
+                             # samples_paths=300,
                              )
 
+    # data_cls.preprocess_files = None
+    # data_cls.aggregate_path_file = None
     # data_cls.aggregate_inn_trn_file = None
 
     sample = None
 
     log_target = True
 
-    # calendar, train, profiles, test = data_cls.preprocess_data(remake_file=True,
+    # calendar, train, profiles, test = data_cls.preprocess_data(remake_file=False,
+    #                                                            use_sum_in_file=True,
+    #                                                            use_cls_trn=False,
+    #                                                            use_cls_vect=True,
     #                                                            sample=sample,
     #                                                            log_target=log_target,
     #                                                            return_pandas=True)
     # inns = train.inn_id.unique()[:10]
     # print(train)
+    # print(train.columns)
+    # print([col for col in train.columns if col.startswith('cls_')])
+    # exit()
 
-    train, test = data_cls.make_agg_data(remake_file=False,
-                                         use_sum_in_file=False,
-                                         add_agg_data=False,
-                                         shift_total=54,
-                                         w_size=53,
+    train, test = data_cls.make_agg_data(remake_file=True,
+                                         use_sum_in_file=True,
+                                         use_cls_trn=False,
+                                         use_cls_vect=False,
+                                         add_agg_data=True,
+                                         shift_total=24,
+                                         w_size=48,
                                          log_target=log_target,
                                          # sample=300,
                                          )
-    inns = train.inn_id.unique()[:10]
+    if "cum_sum" in train.columns:
+        inns = train[train["cum_sum"] > 0.01]["inn_id"].unique()[:10]
+    else:
+        inns = train["inn_id"].unique()[:10]
     if 'd1' in train.columns:
         print(train[['inn_id', 'week', 'd1', 'q', 'target']])
     else:
@@ -881,3 +945,5 @@ if __name__ == "__main__":
                                           index=False)
     print(train.columns)
     print(test.columns)
+
+    # print(merge_submits([62, 63, 65]))
